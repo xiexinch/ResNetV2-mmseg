@@ -8,7 +8,6 @@ import warnings
 
 import mmcv
 import torch
-from mmcv.cnn.utils import revert_sync_batchnorm
 from mmcv.runner import get_dist_info, init_dist
 from mmcv.utils import Config, DictAction, get_git_hash
 
@@ -17,6 +16,11 @@ from mmseg.apis import set_random_seed, train_segmentor
 from mmseg.datasets import build_dataset
 from mmseg.models import build_segmentor
 from mmseg.utils import collect_env, get_root_logger
+
+try:
+    from mmcv.cnn.utils import revert_sync_batchnorm
+except ImportError:
+    revert_sync_batchnorm = None
 
 
 def parse_args():
@@ -139,13 +143,14 @@ def main():
         test_cfg=cfg.get('test_cfg'))
     model.init_weights()
 
-    # SyncBN is not support for DP
-    if not distributed:
-        warnings.warn(
-            'SyncBN is only supported with DDP. To be compatible with DP, '
-            'we convert SyncBN to BN. Please use dist_train.sh which can '
-            'avoid this error.')
-        model = revert_sync_batchnorm(model)
+    if revert_sync_batchnorm:
+        # SyncBN is not support for DP
+        if not distributed:
+            warnings.warn(
+                'SyncBN is only supported with DDP. To be compatible with DP, '
+                'we convert SyncBN to BN. Please use dist_train.sh which can '
+                'avoid this error.')
+            model = revert_sync_batchnorm(model)
 
     logger.info(model)
 
