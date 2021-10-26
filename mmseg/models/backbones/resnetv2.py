@@ -42,9 +42,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.cnn import build_activation_layer
+from mmcv.runner.base_module import BaseModule
 
+from mmseg.utils.logger import get_root_logger
 from ..builder import BACKBONES
-from ..utils import AvgPool2dSame, DropPath, create_pool2d
+from ..utils import AvgPool2dSame, DropPath, create_pool2d, get_padding
 from .helpers import adapt_input_conv, named_apply
 
 
@@ -73,14 +75,59 @@ class GroupNormAct(nn.GroupNorm):
         if isinstance(act_layer, str):
             act_layer = build_activation_layer(act_layer)
         if act_layer is not None and apply_act:
-            act_args = dict(inplace=True) if inplace else {}
-            self.act = act_layer(**act_args)
+            # act_args = dict(inplace=True) if inplace else {}
+            # self.act = act_layer(**act_args)
+            act_layer['inplace'] = inplace
+            self.act = build_activation_layer(act_layer)
         else:
             self.act = nn.Identity()
 
     def forward(self, x):
         x = F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
         x = self.act(x)
+        return x
+
+
+class StdConv2d(nn.Conv2d):
+    """Conv2d with Weight Standardization. Used for BiT ResNet-V2 models.
+
+    Paper: `Micro-Batch Training with Batch-Channel Normalization and Weight
+    Standardization` - https://arxiv.org/abs/1903.10520v2
+    """
+
+    def __init__(self,
+                 in_channel,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=None,
+                 dilation=1,
+                 groups=1,
+                 bias=False,
+                 eps=1e-6):
+        if padding is None:
+            padding = get_padding(kernel_size, stride, dilation)
+        super().__init__(
+            in_channel,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias)
+        self.eps = eps
+
+    def forward(self, x):
+        weight = F.batch_norm(
+            self.weight.reshape(1, self.out_channels, -1),
+            None,
+            None,
+            training=True,
+            momentum=0.,
+            eps=self.eps).reshape_as(self.weight)
+        x = F.conv2d(x, weight, self.bias, self.stride, self.padding,
+                     self.dilation, self.groups)
         return x
 
 
@@ -110,7 +157,7 @@ class PreActBottleneck(nn.Module):
                  drop_path_rate=0.):
         super().__init__()
         first_dilation = first_dilation or dilation
-        conv_layer = conv_layer or nn.Conv2d
+        conv_layer = conv_layer or StdConv2d
         norm_layer = norm_layer or partial(GroupNormAct, num_groups=32)
         out_chs = out_chs or in_chs
         mid_chs = make_div(out_chs * bottle_ratio)
@@ -184,7 +231,7 @@ class Bottleneck(nn.Module):
         super().__init__()
         first_dilation = first_dilation or dilation
         act_layer = act_layer or nn.ReLU
-        conv_layer = conv_layer or nn.Conv2d
+        conv_layer = conv_layer or StdConv2d
         norm_layer = norm_layer or partial(GroupNormAct, num_groups=32)
         out_chs = out_chs or in_chs
         mid_chs = make_div(out_chs * bottle_ratio)
@@ -349,7 +396,7 @@ def create_resnetv2_stem(in_chs,
                          out_chs=64,
                          stem_type='',
                          preact=True,
-                         conv_layer=nn.Conv2d,
+                         conv_layer=StdConv2d,
                          norm_layer=partial(GroupNormAct, num_groups=32)):
     stem = OrderedDict()
     assert stem_type in ('', 'fixed', 'same', 'deep', 'deep_fixed',
@@ -395,11 +442,12 @@ def create_resnetv2_stem(in_chs,
 
 
 @BACKBONES.register_module()
-class ResNetV2(nn.Module):
+class ResNetV2(BaseModule):
     """Implementation of Pre-activation (v2) ResNet mode."""
+    arch_settings = {50: [3, 4, 6, 3], 101: [3, 4, 23, 3], 152: [3, 8, 36, 3]}
 
     def __init__(self,
-                 layers,
+                 depth,
                  channels=(256, 512, 1024, 2048),
                  in_chans=3,
                  global_pool='avg',
@@ -410,15 +458,20 @@ class ResNetV2(nn.Module):
                  avg_down=False,
                  preact=True,
                  act_layer=nn.ReLU,
-                 conv_layer=nn.Conv2d,
+                 conv_layer=StdConv2d,
                  norm_layer=partial(GroupNormAct, num_groups=32),
                  drop_rate=0.,
                  drop_path_rate=0.,
-                 zero_init_last=False):
-        super().__init__()
+                 zero_init_last=False,
+                 pretrained=None,
+                 init_cfg=None):
+        super(ResNetV2, self).__init__(init_cfg)
         self.drop_rate = drop_rate
         wf = width_factor
-
+        if depth not in self.arch_settings:
+            raise KeyError(f'invalid depth {depth} for resnet')
+        layers = self.arch_settings[depth]
+        self.pretrained = pretrained
         self.feature_info = []
         stem_chs = make_div(stem_chs * wf)
         self.stem = create_resnetv2_stem(
@@ -475,11 +528,16 @@ class ResNetV2(nn.Module):
     # self.num_features = prev_chs
     # self.norm = norm_layer(self.num_features) if preact else nn.Identity()
 
-        self.init_weights(zero_init_last=zero_init_last)
+    # self.init_weights(zero_init_last=zero_init_last)
 
     def init_weights(self, zero_init_last=True):
-        named_apply(
-            partial(_init_weights, zero_init_last=zero_init_last), self)
+        logger = get_root_logger()
+        if self.pretrained is None:
+            named_apply(
+                partial(_init_weights, zero_init_last=zero_init_last), self)
+        else:
+            logger.info(f'Load pretrained model from {self.pretrained}')
+            self.load_pretrained(self.pretrained)
 
     @torch.jit.ignore()
     def load_pretrained(self, checkpoint_path, prefix='resnet/'):
@@ -528,13 +586,13 @@ def _load_weights(model: nn.Module,
         model.stem.conv.weight.shape[1],
         t2p(weights[f'{prefix}root_block/standardized_conv2d/kernel']))
     model.stem.conv.weight.copy_(stem_conv_w)
-    model.norm.weight.copy_(t2p(weights[f'{prefix}group_norm/gamma']))
-    model.norm.bias.copy_(t2p(weights[f'{prefix}group_norm/beta']))
-    if isinstance(getattr(model.head, 'fc', None), nn.Conv2d) and \
-        model.head.fc.weight.shape[0] ==\
-            weights[f'{prefix}head/conv2d/kernel'].shape[-1]:
-        model.head.fc.weight.copy_(t2p(weights[f'{prefix}head/conv2d/kernel']))
-        model.head.fc.bias.copy_(t2p(weights[f'{prefix}head/conv2d/bias']))
+    # model.norm.weight.copy_(t2p(weights[f'{prefix}group_norm/gamma']))
+    # model.norm.bias.copy_(t2p(weights[f'{prefix}group_norm/beta']))
+    # if isinstance(getattr(model.head, 'fc', None), nn.Conv2d) and \
+    #     model.head.fc.weight.shape[0] ==\
+    #         weights[f'{prefix}head/conv2d/kernel'].shape[-1]:
+    #     model.head.fc.weight.copy_(t2p(weights[f'{prefix}head/conv2d/kernel']))
+    #     model.head.fc.bias.copy_(t2p(weights[f'{prefix}head/conv2d/bias']))
     for i, (sname, stage) in enumerate(model.stages.named_children()):
         for j, (bname, block) in enumerate(stage.blocks.named_children()):
             cname = 'standardized_conv2d'
