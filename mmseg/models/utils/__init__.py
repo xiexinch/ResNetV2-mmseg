@@ -5,6 +5,7 @@ from .make_divisible import make_divisible
 from .padding import (get_padding, get_padding_value, get_same_padding,
                       is_static_pad, pad_same)
 from .pool import AvgPool2dSame
+from .pool2d_same import create_pool2d
 from .res_layer import ResLayer
 from .se_layer import SELayer
 from .self_attention_block import SelfAttentionBlock
@@ -15,5 +16,6 @@ __all__ = [
     'ResLayer', 'SelfAttentionBlock', 'make_divisible', 'InvertedResidual',
     'UpConvBlock', 'InvertedResidualV3', 'SELayer', 'PatchEmbed',
     'nchw_to_nlc', 'nlc_to_nchw', 'DropPath', 'pad_same', 'get_padding',
-    'get_padding_value', 'get_same_padding', 'is_static_pad', 'AvgPool2dSame'
+    'get_padding_value', 'get_same_padding', 'is_static_pad', 'AvgPool2dSame',
+    'create_pool2d'
 ]
